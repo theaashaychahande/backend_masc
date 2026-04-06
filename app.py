@@ -5,16 +5,38 @@ from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, WebRtcMode
 import av
 from collections import deque
-
 import threading
+import serial
+import time
 
 st.set_page_config(page_title="Vision Detection App", layout="wide")
 st.title("Smart Vision Detection System")
 
-# Shared state for detections
+# --- Arduino Serial Configuration ---
+st.sidebar.title("Arduino Settings")
+COM_PORT = st.sidebar.text_input("Serial Port (e.g. COM3 or /dev/ttyUSB0)", "COM3")
+BAUD_RATE = 9600
+CONVEYOR_DELAY = st.sidebar.slider("Conveyor Delay (seconds)", 1.0, 1.5, 1.2, 0.1)
+
+@st.cache_resource
+def get_arduino_connection(port):
+    try:
+        ser = serial.Serial(port, BAUD_RATE, timeout=1)
+        time.sleep(2) # Wait for Arduino to reset
+        st.sidebar.success(f"Connected to Arduino on {port}")
+        return ser
+    except Exception as e:
+        st.sidebar.error(f"Arduino not connected: {e}")
+        return None
+
+arduino = get_arduino_connection(COM_PORT)
+
+# Shared state for detections and serial cooldown
 class SharedState:
     def __init__(self):
         self.current_detections = []
+        self.last_sent_command = None
+        self.last_sent_time = 0
         self.lock = threading.Lock()
 
     def update(self, detections):
@@ -24,6 +46,28 @@ class SharedState:
     def get(self):
         with self.lock:
             return self.current_detections
+
+    def send_to_arduino(self, command, delay):
+        with self.lock:
+            current_time = time.time()
+            # Only send if it's a new command OR 3 seconds have passed since last send (to avoid spamming)
+            if command != self.last_sent_command or (current_time - self.last_sent_time > 3):
+                self.last_sent_command = command
+                self.last_sent_time = current_time
+                
+                # Execute in a separate thread to not block the vision processing
+                def delayed_send():
+                    time.sleep(delay)
+                    if arduino and arduino.is_open:
+                        try:
+                            arduino.write(f"{command}\n".encode())
+                            print(f"Sent: {command}")
+                        except Exception as e:
+                            print(f"Error sending to Arduino: {e}")
+                    else:
+                        print(f"Failed to send {command}: Arduino not connected")
+
+                threading.Thread(target=delayed_send, daemon=True).start()
 
 if "shared_state" not in st.session_state:
     st.session_state.shared_state = SharedState()
@@ -158,22 +202,64 @@ def detect_shapes(frame):
 
 
 class VisionProcessor:
-    def __init__(self, mode, shared_state):
+    def __init__(self, mode, shared_state, delay):
         self.mode = mode
         self.shared_state = shared_state
+        self.delay = delay
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
         labels = []
+        arduino_command = None
         
         if self.mode == "Object":
             img, labels = detect_objects(img)
+            # Sorting logic: Pen -> BIN_1, Eraser -> BIN_2, Celotape -> BIN_3
+            for label in labels:
+                if "Pen" in label:
+                    arduino_command = "BIN_1"
+                    break
+                elif "Eraser" in label:
+                    arduino_command = "BIN_2"
+                    break
+                elif "Celotape" in label:
+                    arduino_command = "BIN_3"
+                    break
+                    
         elif self.mode == "Color":
             img, labels = detect_colors(img)
+            # Sorting logic: Red -> BIN_1, Blue -> BIN_2, Yellow -> BIN_3, White -> BIN_3
+            for label in labels:
+                if "Red" in label:
+                    arduino_command = "BIN_1"
+                    break
+                elif "Blue" in label:
+                    arduino_command = "BIN_2"
+                    break
+                elif "Yellow" in label or "White" in label:
+                    arduino_command = "BIN_3"
+                    break
+                    
         elif self.mode == "Shape":
             img, labels = detect_shapes(img)
+            # Sorting logic: Square -> BIN_1, Triangle -> BIN_2, Circle -> BIN_3
+            for label in labels:
+                if "Square" in label or "Eraser" in label:
+                    arduino_command = "BIN_1"
+                    break
+                elif "Triangle" in label:
+                    arduino_command = "BIN_2"
+                    break
+                elif "Circle" in label or "Celotape" in label:
+                    arduino_command = "BIN_3"
+                    break
         
+        # Update UI labels
         self.shared_state.update(labels)
+        
+        # Send to Arduino if a command was identified
+        if arduino_command:
+            self.shared_state.send_to_arduino(arduino_command, self.delay)
             
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
@@ -183,12 +269,13 @@ tab1, tab2, tab3 = st.tabs(["Object Detection", "Color Detection", "Shape Detect
 
 def start_webrtc(key, mode):
     shared_state = st.session_state.shared_state
+    delay = CONVEYOR_DELAY
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         webrtc_streamer(
             key=key,
             mode=WebRtcMode.SENDRECV,
-            video_processor_factory=lambda: VisionProcessor(mode, shared_state),
+            video_processor_factory=lambda: VisionProcessor(mode, shared_state, delay),
             rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
             media_stream_constraints={"video": True, "audio": False},
             async_processing=True,
